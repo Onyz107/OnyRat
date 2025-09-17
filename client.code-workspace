@@ -1,0 +1,11 @@
+{
+  "folders": [
+    { "path": "." }
+  ],
+  "settings": {
+    "go.toolsManagement.autoUpdate": true,
+    "gopls": {
+      "build.buildFlags": ["-tags=client"]
+    }
+  }
+}
